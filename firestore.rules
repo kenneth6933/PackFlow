@@ -1,0 +1,83 @@
+rules_version = '2';
+service cloud.firestore {
+ match /databases/{database}/documents {
+  function signed(){return request.auth!=null;}
+  function member(){return get(/databases/$(database)/documents/members/$(request.auth.uid)).data;}
+  function active(){return signed() && member().active==true;}
+  function admin(){return active() && member().role=='admin';}
+  function driver(){return active() && member().role=='driver';}
+  function packer(id){return active() && member().role=='packer' && member().id==id;}
+  function ref(k,id){return /databases/$(database)/documents/spark/ops/$(k)/$(id);}
+  function monthString(t){let local=t+duration.value(8,'h');let m=local.month();return string(local.year())+'-'+(m<10?'0':'')+string(m);}
+  function isInt(n){return n is int && n>=0;}
+  function task(id){return get(ref('tasks',id)).data;}
+  function pool(id){return get(ref('pools',id)).data;}
+  function remain(t){return t.ctn*t.supplierSize-t.receivedPcs*t.rpUnit-t.approvedLossRaw;}
+  function validTask(id){
+   let t=request.resource.data;
+   let p=get(ref('products',t.productId)).data;
+   let u=get(ref('users',t.packerId)).data;
+   let price=get(ref('prices',t.rateVersion)).data;
+   let extra=get(ref('extras',t.extraVersion)).data;
+   return driver() && t.keys().hasOnly(['id','orderId','productId','productCode','productName','packerId','driverId','ctn','expected','supplierSize','rpUnit','ninsoSize','occurredAt','uploadedAt','rateVersion','extraVersion','poolId','receivedPcs','approvedLossRaw','lastReceiptId'])
+    && t.id==id && t.driverId==member().id && u.active && u.role=='packer' && p.active && p.barcode.size()>0
+    && isInt(t.ctn) && t.ctn>0 && t.ctn<=100000 && t.supplierSize==p.supplierSize && t.rpUnit==p.rpUnit && t.ninsoSize==p.ninsoSize
+    && t.expected==(t.ctn*t.supplierSize*1.0) / t.rpUnit && t.productCode==p.code && t.productName==p.name
+    && t.poolId==t.packerId+'_'+t.productId && t.receivedPcs==0 && t.approvedLossRaw==0 && t.lastReceiptId==''
+    && t.occurredAt is timestamp && t.occurredAt<=request.time+duration.value(5,'m') && t.uploadedAt==request.time
+    && price.productId==t.productId && extra.packerId==t.packerId
+    && price.startsAt<=t.occurredAt && t.occurredAt<price.endsAt && extra.startsAt<=t.occurredAt && t.occurredAt<extra.endsAt
+    && getAfter(ref('pools',t.poolId)).data.lastDeliveryId==id;
+  }
+  function validPoolCreate(){let p=request.resource.data;let t=getAfter(ref('tasks',p.lastDeliveryId)).data;
+   return driver() && p.keys().hasOnly(['id','queue','head','revision','lastDeliveryId','lastReceiptId','lastOccurredAt']) && p.queue==[t.id] && p.head==0 && p.revision==1 && p.id==t.poolId && p.lastOccurredAt==t.occurredAt && p.lastReceiptId=='';}
+  function validPoolUpdate(){let b=resource.data;let a=request.resource.data;
+   return driver() && a.id==b.id && a.revision==b.revision+1 && (appendPool(b,a)||collectPool(b,a));}
+  function appendPool(b,a){let t=getAfter(ref('tasks',a.lastDeliveryId)).data;
+   return a.diff(b).affectedKeys().hasOnly(['queue','revision','lastDeliveryId','lastOccurredAt'])
+    && a.queue==b.queue.concat([a.lastDeliveryId]) && !b.queue.hasAny([a.lastDeliveryId]) && a.lastOccurredAt>=b.lastOccurredAt
+    && t.poolId==a.id && t.occurredAt==a.lastOccurredAt && !exists(ref('tasks',t.id));}
+  function collectPool(b,a){let r=getAfter(ref('returns',a.lastReceiptId)).data;let t=getAfter(ref('tasks',r.taskId)).data;
+   return a.diff(b).affectedKeys().hasOnly(['head','revision','lastReceiptId']) && r.taskId==b.queue[b.head] && r.poolId==a.id
+    && a.head==(remain(t)<t.rpUnit?b.head+1:b.head) && !exists(ref('returns',r.id));}
+  function consumeTask(){let b=resource.data;let a=request.resource.data;let r=getAfter(ref('returns',a.lastReceiptId)).data;
+   return driver() && a.diff(b).affectedKeys().hasOnly(['receivedPcs','lastReceiptId']) && isInt(a.receivedPcs)
+    && a.receivedPcs==b.receivedPcs+r.pcs && remain(a)>=0 && r.taskId==b.id && !exists(ref('returns',r.id));}
+  function adjustTask(){let b=resource.data;let a=request.resource.data;let old=get(ref('adjustments',a.lastAdjustmentId)).data;let adj=getAfter(ref('adjustments',a.lastAdjustmentId)).data;return packer(old.packerId) && old.status=='pending' && adj.status=='confirmed' && adj.taskId==b.id && a.diff(b).affectedKeys().hasOnly(['receivedPcs','lastAdjustmentId']) && a.receivedPcs==b.receivedPcs+old.pcs && isInt(a.receivedPcs) && remain(a)>=0;}
+  function adjustPool(){let b=resource.data;let a=request.resource.data;let old=get(ref('adjustments',a.lastAdjustmentId)).data;let adj=getAfter(ref('adjustments',a.lastAdjustmentId)).data;let task=getAfter(ref('tasks',adj.taskId)).data;return packer(old.packerId) && old.status=='pending' && adj.status=='confirmed' && task.lastAdjustmentId==adj.id && task.poolId==b.id && a.diff(b).affectedKeys().hasOnly(['head','revision','lastAdjustmentId']) && a.revision==b.revision+1 && (a.head==b.head || a.head<b.head && a.queue[a.head]==adj.taskId && remain(task)>=task.rpUnit || a.head==b.head+1 && b.queue[b.head]==adj.taskId && remain(task)<task.rpUnit);}
+  function validReceipt(id){let r=request.resource.data;let t=task(r.taskId);let p=pool(t.poolId);let a=getAfter(ref('tasks',t.id)).data;
+   return driver() && r.keys().hasOnly(['id','collectionId','taskId','poolId','productId','productName','productCode','packerId','driverId','pcs','ninsoSize','occurredAt','uploadedAt','serviceMonth','status','version','settlementId'])
+    && r.id==id && r.driverId==member().id && r.packerId==t.packerId && r.productId==t.productId && r.productCode==t.productCode && r.productName==t.productName && r.ninsoSize==t.ninsoSize
+    && isInt(r.pcs) && r.pcs>0 && r.pcs*t.rpUnit<=remain(t) && r.taskId==p.queue[p.head] && r.poolId==t.poolId
+    && r.status=='pending' && r.version==1 && r.settlementId==null && r.occurredAt is timestamp && r.occurredAt<=request.time+duration.value(5,'m') && r.uploadedAt==request.time
+    && r.serviceMonth==monthString(r.occurredAt) && a.lastReceiptId==id && a.receivedPcs==t.receivedPcs+r.pcs && getAfter(ref('pools',t.poolId)).data.lastReceiptId==id;
+  }
+  function packerReceipt(){let b=resource.data;let a=request.resource.data;
+   return packer(b.packerId) && b.status=='pending' && b.settlementId==null && (a.diff(b).affectedKeys().hasOnly(['status','confirmedAt','confirmedBy']) && a.status=='confirmed' && a.confirmedAt==request.time && a.confirmedBy==member().id && getAfter(ref('payroll',b.id)).data.status=='confirmed'
+    || a.diff(b).affectedKeys().hasOnly(['status','dispute']) && a.status=='disputed' && a.dispute is string && a.dispute.size()>0 && a.dispute.size()<=1000);}
+  function validPayroll(id){let a=request.resource.data;let r=getAfter(ref('returns',id)).data;let t=task(r.taskId);let base=get(ref('prices',t.rateVersion)).data;let extra=get(ref('extras',t.extraVersion)).data;
+   return packer(r.packerId) && a.keys().hasOnly(['id','packerId','rateMicros','amountCents','status','version','confirmedAt']) && a.id==id && a.packerId==r.packerId && a.status=='confirmed' && a.version==r.version && a.confirmedAt==request.time
+    && r.status=='confirmed' && r.confirmedAt==request.time && a.rateMicros==base.rateMicros+extra.extraMicros && a.amountCents==math.round(r.pcs*a.rateMicros / 10000.0);
+  }
+  function confirmCorrectedPayroll(){let b=resource.data;let a=request.resource.data;let r=getAfter(ref('returns',a.id)).data;
+   return packer(b.packerId) && b.status=='pending' && a.diff(b).affectedKeys().hasOnly(['status','confirmedAt']) && a.status=='confirmed' && a.confirmedAt==request.time && r.status=='confirmed' && r.version==a.version && r.confirmedAt==request.time;}
+  match /members/{uid}{allow read:if signed() && (request.auth.uid==uid||admin());allow write:if admin();}
+  match /spark/ops/{kind}/{id}{
+   allow read:if admin();
+   allow delete:if admin() && kind=='products';
+   allow create,update:if admin() && kind!='audits';
+   allow create:if active() && kind=='audits' && request.resource.data.actorId==member().id && request.resource.data.at==request.time;
+   allow read:if active() && (kind in ['products','users','pools','meta'] || kind=='prices' && member().role=='packer' || kind=='extras' && packer(resource.data.packerId));
+   allow get:if kind=='payroll' && !exists(ref('payroll',id)) && packer(get(ref('returns',id)).data.packerId);
+   allow read:if active() && (kind in ['tasks','returns','losses','syncErrors'] && (member().role=='driver'||packer(resource.data.packerId)) || kind in ['payroll','statements','adjustments'] && packer(resource.data.packerId));
+   allow create:if active() && kind=='meta' && id=='revision' && request.resource.data.keys().hasOnly(['value']) && request.resource.data.value==1;
+   allow update:if active() && kind=='meta' && id=='revision' && request.resource.data.keys().hasOnly(['value']) && request.resource.data.value==resource.data.value+1;
+   allow create:if kind=='tasks' && validTask(id) || kind=='pools' && validPoolCreate() || kind=='returns' && validReceipt(id) || kind=='payroll' && validPayroll(id);
+   allow update:if kind=='tasks' && (consumeTask()||adjustTask()) || kind=='pools' && (validPoolUpdate()||adjustPool()) || kind=='returns' && packerReceipt() || kind=='payroll' && confirmCorrectedPayroll();
+   allow update:if kind=='adjustments' && packer(resource.data.packerId) && resource.data.status=='pending' && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status','confirmedAt']) && request.resource.data.status=='confirmed' && request.resource.data.confirmedAt==request.time && getAfter(ref('tasks',resource.data.taskId)).data.receivedPcs==get(ref('tasks',resource.data.taskId)).data.receivedPcs+resource.data.pcs && getAfter(ref('tasks',resource.data.taskId)).data.lastAdjustmentId==id && getAfter(ref('pools',get(ref('tasks',resource.data.taskId)).data.poolId)).data.lastAdjustmentId==id;
+   allow create:if driver() && kind=='losses' && request.resource.data.keys().hasOnly(['id','taskId','qty','unit','reason','note','rawQty','packerId','driverId','status','at']) && request.resource.data.id==id && request.resource.data.driverId==member().id && request.resource.data.packerId==task(request.resource.data.taskId).packerId && request.resource.data.status=='pending' && request.resource.data.reason in ['damaged','missing'] && request.resource.data.unit in ['raw','finished'] && isInt(request.resource.data.qty) && request.resource.data.qty>0 && request.resource.data.rawQty==request.resource.data.qty*(request.resource.data.unit=='raw'?1:task(request.resource.data.taskId).rpUnit) && request.resource.data.rawQty<=remain(task(request.resource.data.taskId)) && request.resource.data.note.size()>0 && request.resource.data.at==request.time;
+   allow create:if driver() && kind=='syncErrors' && request.resource.data.driverId==member().id && request.resource.data.status=='pending';
+  }
+ }
+}
+

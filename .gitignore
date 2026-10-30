@@ -1,0 +1,14 @@
+# Local folders and credentials
+node_modules/
+.firebase/
+.firebaserc
+.openai/
+.env*
+.secret*
+*.log
+*.key
+*.pem
+*service-account*.json
+application_default_credentials.json
+accounts-private*.csv
+backup*.json
