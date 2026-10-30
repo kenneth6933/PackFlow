@@ -1,0 +1,1 @@
+export function allowsRole(portal,role){if(portal==='admin')return role==='admin';if(portal==='mobile')return ['admin','driver','packer'].includes(role);if(portal==='driver'||portal==='packer')return portal===role;return portal==='all'&&['admin','driver','packer'].includes(role);}
